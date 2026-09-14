@@ -1,0 +1,5 @@
+services:
+  blender-mcp:
+    gpus: all
+    environment:
+      - NVIDIA_DRIVER_CAPABILITIES=compute,graphics,display,utility,video
