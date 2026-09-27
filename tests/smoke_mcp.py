@@ -12,23 +12,20 @@ import zipfile
 from pathlib import Path
 
 from mcp import ClientSession
-from mcp.client.streamable_http import create_mcp_http_client, streamable_http_client
+from mcp.client.streamable_http import streamable_http_client
 from mcp.types import EmbeddedResource
 
 
 async def run(
     endpoint: str,
     blend_path: Path | None,
-    token: str | None,
     check_cpu_denials: bool,
     check_gpu_engines: bool,
     frame_number: int | None,
     timeout_seconds: int,
     poll_interval: float,
 ) -> None:
-    headers = {"Authorization": f"Bearer {token}"} if token else None
-    http_client = create_mcp_http_client(headers=headers)
-    async with streamable_http_client(endpoint, http_client=http_client) as (read, write):
+    async with streamable_http_client(endpoint) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
             tools = await session.list_tools()
@@ -240,7 +237,6 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--endpoint", default="http://localhost:8080/mcp")
     parser.add_argument("--blend", type=Path)
-    parser.add_argument("--token", default=None)
     parser.add_argument("--check-cpu-denials", action="store_true")
     parser.add_argument("--check-gpu-engines", action="store_true")
     parser.add_argument(
@@ -255,7 +251,6 @@ def main() -> None:
         run(
             args.endpoint,
             args.blend,
-            args.token,
             args.check_cpu_denials,
             args.check_gpu_engines,
             args.frame,

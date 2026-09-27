@@ -4,7 +4,6 @@ import asyncio
 import base64
 import binascii
 import csv
-import hmac
 import json
 import os
 import shutil
@@ -775,48 +774,8 @@ async def download_render_frames(job_id: str) -> CallToolResult:
         return _tool_error(f"could not download rendered frames: {exc}")
 
 
-class BearerAuthApp:
-    """ASGI wrapper for optional static bearer-token authentication."""
-
-    def __init__(self, app: Any, token: str | None) -> None:
-        self.app = app
-        self.expected = f"Bearer {token}".encode("utf-8") if token is not None else None
-
-    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
-        if self.expected is not None and scope.get("type") == "http":
-            authorization = next(
-                (
-                    value
-                    for name, value in scope.get("headers", [])
-                    if name.lower() == b"authorization"
-                ),
-                b"",
-            )
-            if not hmac.compare_digest(authorization, self.expected):
-                body = b'{"error":"unauthorized"}'
-                await send(
-                    {
-                        "type": "http.response.start",
-                        "status": 401,
-                        "headers": [
-                            (b"content-type", b"application/json"),
-                            (b"content-length", str(len(body)).encode("ascii")),
-                            (b"www-authenticate", b"Bearer"),
-                        ],
-                    }
-                )
-                await send({"type": "http.response.body", "body": body})
-                return
-        await self.app(scope, receive, send)
-
-
-def create_app(token: str | None = None) -> BearerAuthApp:
-    if token is None:
-        token = os.getenv("MCP_BEARER_TOKEN")
-    if token is not None and not token.strip():
-        raise ValueError("MCP_BEARER_TOKEN is set but empty")
-
-    mcp_app = server.streamable_http_app(
+def create_app() -> Any:
+    return server.streamable_http_app(
         streamable_http_path="/mcp",
         json_response=True,
         stateless_http=True,
@@ -826,30 +785,7 @@ def create_app(token: str | None = None) -> BearerAuthApp:
             enable_dns_rebinding_protection=False
         ),
     )
-    return BearerAuthApp(mcp_app, token)
-
-
-def cloudflared_command(token: str | None = None) -> list[str] | None:
-    if token is None:
-        token = os.getenv("CLOUDFLARE_TUNNEL_TOKEN")
-    if token is None or not token.strip():
-        return None
-    return ["cloudflared", "tunnel", "run", "--token", token]
-
-
-def start_cloudflare_tunnel() -> subprocess.Popen[bytes] | None:
-    command = cloudflared_command()
-    if command is None:
-        print(
-            "CLOUDFLARE_TUNNEL_TOKEN is unset; starting without a Cloudflare Tunnel.",
-            flush=True,
-        )
-        return None
-    print("Starting Cloudflare Tunnel connector.", flush=True)
-    return subprocess.Popen(command)
-
-
-def stop_cloudflare_tunnel(process: subprocess.Popen[bytes] | None) -> None:
+def stop_process(process: subprocess.Popen[bytes] | None) -> None:
     if process is None or process.poll() is not None:
         return
     process.terminate()
@@ -860,16 +796,94 @@ def stop_cloudflare_tunnel(process: subprocess.Popen[bytes] | None) -> None:
         process.wait()
 
 
+def start_tailscale() -> subprocess.Popen[bytes] | None:
+    auth_key = os.getenv("TAILSCALE_AUTH_KEY")
+    if auth_key is None or not auth_key.strip():
+        return None
+
+    state_dir = Path.home() / ".local/share/tailscale"
+    state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    socket_path = state_dir / "tailscaled.sock"
+    socket_path.unlink(missing_ok=True)
+    socket_option = f"--socket={socket_path}"
+    try:
+        daemon = subprocess.Popen(
+            [
+                "tailscaled",
+                "--tun=userspace-networking",
+                f"--state={state_dir / 'tailscaled.state'}",
+                socket_option,
+            ]
+        )
+    except OSError as exc:
+        print(f"Tailscale daemon could not start: {exc}", flush=True)
+        return None
+    try:
+        deadline = time.monotonic() + 15
+        while not socket_path.exists():
+            if daemon.poll() is not None or time.monotonic() >= deadline:
+                raise RuntimeError("Tailscale daemon failed to start")
+            time.sleep(0.1)
+
+        # The CLI reads the key from a private temporary file, keeping it out
+        # of process arguments and Docker build history.
+        key_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", prefix="tailscale-auth-key-", delete=False
+            ) as key_file:
+                key_path = Path(key_file.name)
+                key_file.write(auth_key)
+            ssh_enabled = os.getenv("TAILSCALE_SSH", "").strip().lower() in (
+                "1", "true", "yes", "on"
+            )
+            subprocess.run(
+                [
+                    "tailscale",
+                    socket_option,
+                    "up",
+                    f"--auth-key=file:{key_path}",
+                    "--hostname=blender-render-mcp",
+                    f"--ssh={str(ssh_enabled).lower()}",
+                ],
+                check=True,
+                timeout=90,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+        finally:
+            if key_path is not None:
+                key_path.unlink(missing_ok=True)
+
+        return daemon
+    except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
+        stop_process(daemon)
+        print(
+            f"Tailscale could not join the tailnet: {_tailscale_error_detail(exc, auth_key)}. "
+            "The MCP server will still start.",
+            flush=True,
+        )
+        return None
+
+
+def _tailscale_error_detail(exc: Exception, auth_key: str) -> str:
+    stderr = getattr(exc, "stderr", None)
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode("utf-8", errors="replace")
+    if stderr:
+        return stderr.strip().replace(auth_key, "[redacted]")[-2000:]
+    return str(exc).replace(auth_key, "[redacted]")
+
+
 def main() -> None:
     import uvicorn
 
-    token = os.getenv("MCP_BEARER_TOKEN")
-    app = create_app(token)
-    tunnel_process = start_cloudflare_tunnel()
+    app = create_app()
+    tailscale_process = start_tailscale()
     try:
         uvicorn.run(app, host="0.0.0.0", port=MCP_PORT, timeout_keep_alive=120)
     finally:
-        stop_cloudflare_tunnel(tunnel_process)
+        stop_process(tailscale_process)
 
 
 if __name__ == "__main__":

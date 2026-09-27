@@ -1,10 +1,10 @@
 # Blender MCP renderer
 
-This image runs a Streamable HTTP MCP server with system Python and launches a separate Blender 5.2 background process for each render. It exposes `get_gpu_info` and an asynchronous render-job API at `http://localhost:8080/mcp`.
+This image runs a Streamable HTTP MCP server from a Python virtual environment and launches a separate Blender 5.2 background process for each render. It exposes `get_gpu_info` and an asynchronous render-job API at `http://localhost:8080/mcp`.
 
-The image includes `cloudflared` and runs it alongside the MCP server when `CLOUDFLARE_TUNNEL_TOKEN` is set. It invokes `cloudflared tunnel run --token <token>`; without the variable, the MCP server starts normally without a tunnel. In the Cloudflare Zero Trust dashboard, configure the tunnel's public hostname to route to `http://localhost:8080` from inside the container. MCP clients connect to the public hostname with the `/mcp` path. Cloudflare documents this token command syntax in its [run parameters](https://developers.cloudflare.com/tunnel/reference/run-parameters/) and the architecture-matched Debian package download in its [cloudflared update instructions](https://developers.cloudflare.com/tunnel/guides/update-cloudflared/).
+The image also includes Tailscale. Set `TAILSCALE_AUTH_KEY` at runtime to join your tailnet as `blender-render-mcp`. Tailscale runs in userspace mode and forwards incoming tailnet connections to the same port on `127.0.0.1`, so clients on the tailnet can use `http://blender-render-mcp:8080/mcp` (or the assigned name, such as `blender-render-mcp-1`). The MCP server keeps running if Tailscale cannot connect; check the container logs and restart it after fixing the connection. Userspace mode needs no TUN device or extra container privileges. Compose persists its login state in the `tailscale-state` volume; mount `/home/headless/.local/share/tailscale` on other platforms if you want the node identity to survive container replacement. Keep the auth key in a runtime environment variable, not a Docker build argument. See Tailscale's [Linux install](https://tailscale.com/docs/install/linux) and [userspace networking behavior](https://tailscale.com/docs/reference/faq/other-vpns).
 
-Cloudflare's Free and Pro plans limit request bodies to 100 MB, while this tool's 100 MiB file limit becomes about 140 MB after base64 encoding and JSON overhead. Business supports 200 MB; Enterprise upload limits can be raised. See [Cloudflare's 413 upload limits](https://developers.cloudflare.com/support/troubleshooting/http-status-codes/4xx-client-error/error-413/) if you need to send files near the tool's full limit.
+To access the container shell over your tailnet, set `TAILSCALE_SSH=true` and allow SSH in your [tailnet access policy](https://tailscale.com/docs/features/tailscale-ssh). Connect as the container's local user, for example `ssh headless@blender-render-mcp`; a RunPod SSH routing name is not a Linux username in the container. Tailscale SSH does not require a separate `sshd` process. If Tailscale assigns a suffix such as `blender-render-mcp-1`, use that name until you remove the old offline node from your tailnet.
 
 ## Start
 
@@ -24,7 +24,7 @@ The GPU override is optional. Without GPU passthrough, Cycles uses CPU. Eevee an
 
 To build and publish the RunPod image as `gongfan99/blender-render-mcp:latest`, first authenticate with Docker Hub using `docker login`, then run `deploy.bat` from Windows.
 
-Set `MCP_BEARER_TOKEN` in the environment before starting Compose to require `Authorization: Bearer <token>`. When it is unset, the MCP endpoint is open. The local port mapping binds only to `127.0.0.1`. For RunPod, provide `CLOUDFLARE_TUNNEL_TOKEN` as a container environment variable; the same image runs both the MCP server and tunnel connector, so no second image or service is needed.
+The local Compose port mapping binds only to `127.0.0.1`. For RunPod, provide `TAILSCALE_AUTH_KEY` as a container environment variable to make the MCP endpoint available to permitted devices on your tailnet. The MCP server has no application-level authentication, so do not configure RunPod to expose port 8080 publicly.
 
 ## Tools
 
@@ -67,14 +67,14 @@ Animation MP4s use H.264 and are capped at 250 MiB; selected-frame PNG archives 
 
 Jobs and results are held on the server's local filesystem for 24 hours by default. They are process-local and are lost if the container restarts; use one server instance for submit, status polling, and download.
 
-Blender renders use the scene's saved settings except the requested engine/device, output format, and output path. Animation jobs use MPEG-4/H.264; selected-frame jobs save PNG images and package them in a ZIP archive.
+Blender keeps the scene's saved engine, frame range, resolution, and samples unless the request overrides them. The worker selects the Cycles device and output path and format. Animation jobs use MPEG-4/H.264; selected-frame jobs save PNG images and package them in a ZIP archive. For Workbench, a sample override selects the closest supported value.
 
 ## Configuration
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `MCP_BEARER_TOKEN` | unset | Optional bearer token; unset means open access. |
-| `CLOUDFLARE_TUNNEL_TOKEN` | unset | Token for the remotely managed Cloudflare Tunnel; when set, starts `cloudflared` in this container. |
+| `TAILSCALE_AUTH_KEY` | unset | Auth key for joining the tailnet as `blender-render-mcp`; unset or empty skips Tailscale startup. |
+| `TAILSCALE_SSH` | unset | Set to `true` to enable Tailscale SSH for the container's `headless` user; requires a tailnet SSH access rule. |
 | `MCP_PORT` | `8080` | HTTP listen port inside the container. |
 | `BLENDER_EXECUTABLE` | `/home/headless/blender/blender` | Blender executable path. |
 | `MAX_RENDER_SECONDS` | `1800` | Maximum duration of one render process. |
@@ -95,10 +95,8 @@ python -m unittest discover -s tests -v
 For a live CPU-only test, create a tiny sample file with Blender in the image, then run the MCP client smoke test. It checks that Eevee and Workbench jobs fail clearly without a GPU and that Cycles returns a valid embedded MP4:
 
 ```sh
-docker run --rm --entrypoint /home/headless/blender/blender \
-  -v "$PWD:/workspace" -w /workspace blender-render-mcp:local \
-  --background --python tests/create_sample_blend.py -- /workspace/tests/cpu_sample.blend
+docker run --rm --entrypoint /home/headless/blender/blender -v "${PWD}:/workspace" -w /workspace blender-render-mcp:local --background --python tests/create_sample_blend.py -- /workspace/tests/cpu_sample.blend
 python tests/smoke_mcp.py --blend tests/cpu_sample.blend --check-cpu-denials --frame 1
 ```
 
-On an NVIDIA host, start Compose with `compose.gpu.yaml` and run the same smoke test with `--check-gpu-engines` to render through Cycles, Eevee, and Workbench. Add `--frame 1` to also verify a selected-frame PNG ZIP render; the requested frame must be within the blend's saved frame range. Add `--token "$MCP_BEARER_TOKEN"` when the container requires authentication.
+On an NVIDIA host, start Compose with `compose.gpu.yaml` and run `python tests/smoke_mcp.py --blend tests/cpu_sample.blend --check-gpu-engines` to render through Cycles, Eevee, and Workbench. Add `--frame 1` to also verify a selected-frame PNG ZIP render; the requested frame must be within the blend's saved frame range.

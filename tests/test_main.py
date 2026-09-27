@@ -12,15 +12,13 @@ from unittest.mock import patch
 from mcp.types import EmbeddedResource
 
 from main import (
-    BearerAuthApp,
     RequestError,
     RenderJobManager,
-    cloudflared_command,
     decode_blend_base64,
     download_render_frames,
     download_render_result,
     parse_nvidia_smi_csv,
-    start_cloudflare_tunnel,
+    start_tailscale,
     validate_render_request,
     validate_frame_archive,
     validate_frame_list,
@@ -261,65 +259,74 @@ class RenderJobManagerTests(unittest.IsolatedAsyncioTestCase):
                     )
 
 
-class BearerAuthTests(unittest.IsolatedAsyncioTestCase):
-    async def _request(self, app, headers=()) -> tuple[int, list[dict]]:
-        response: list[dict] = []
+class TailscaleTests(unittest.TestCase):
+    def test_missing_or_empty_key_disables_tailscale(self) -> None:
+        for value in (None, "", "   "):
+            environment = {} if value is None else {"TAILSCALE_AUTH_KEY": value}
+            with (
+                self.subTest(value=value),
+                patch.dict(os.environ, environment, clear=True),
+                patch("main.subprocess.Popen") as popen,
+            ):
+                self.assertIsNone(start_tailscale())
+                popen.assert_not_called()
 
-        async def receive():
-            return {"type": "http.request", "body": b"", "more_body": False}
+    def test_key_starts_userspace_daemon(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_dir = Path(temp_dir) / ".local/share/tailscale"
+            commands = []
+            key_paths = []
 
-        async def send(message):
-            response.append(message)
+            def launch_daemon(command):
+                state_dir.joinpath("tailscaled.sock").touch()
+                return daemon
 
-        await app(
-            {"type": "http", "method": "GET", "path": "/mcp", "headers": list(headers)},
-            receive,
-            send,
-        )
-        return next(item["status"] for item in response if item["type"] == "http.response.start"), response
+            def run_cli(command, **kwargs):
+                commands.append(command)
+                if "up" in command:
+                    key_path = Path(next(arg for arg in command if arg.startswith("--auth-key=file:"))[16:])
+                    key_paths.append(key_path)
+                    self.assertEqual(key_path.read_text(), "test-auth-key")
 
-    async def test_requires_correct_bearer_token(self) -> None:
-        async def inner(scope, receive, send):
-            await send({"type": "http.response.start", "status": 204, "headers": []})
-            await send({"type": "http.response.body", "body": b""})
+            with (
+                patch.dict(os.environ, {"TAILSCALE_AUTH_KEY": "test-auth-key"}, clear=True),
+                patch("main.Path.home", return_value=Path(temp_dir)),
+                patch("main.subprocess.Popen", side_effect=launch_daemon) as popen,
+                patch("main.subprocess.run", side_effect=run_cli),
+            ):
+                daemon = unittest.mock.Mock()
+                process = start_tailscale()
 
-        app = BearerAuthApp(inner, "secret")
-        status, _ = await self._request(app)
-        self.assertEqual(status, 401)
-        status, _ = await self._request(app, [(b"authorization", b"Bearer secret")])
-        self.assertEqual(status, 204)
+            self.assertIs(process, daemon)
+            self.assertEqual(popen.call_args.args[0][0:2], ["tailscaled", "--tun=userspace-networking"])
+            self.assertIn("--hostname=blender-render-mcp", commands[0])
+            self.assertIn("--ssh=false", commands[0])
+            self.assertEqual(len(commands), 1)
+            self.assertNotIn("test-auth-key", str(commands))
+            self.assertFalse(key_paths[0].exists())
 
-    async def test_unset_token_leaves_endpoint_open(self) -> None:
-        async def inner(scope, receive, send):
-            await send({"type": "http.response.start", "status": 204, "headers": []})
-            await send({"type": "http.response.body", "body": b""})
+    def test_ssh_can_be_enabled_for_headless_user(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_dir = Path(temp_dir) / ".local/share/tailscale"
+            commands = []
 
-        status, _ = await self._request(BearerAuthApp(inner, None))
-        self.assertEqual(status, 204)
+            def launch_daemon(command):
+                state_dir.joinpath("tailscaled.sock").touch()
+                return unittest.mock.Mock()
 
+            with (
+                patch.dict(
+                    os.environ,
+                    {"TAILSCALE_AUTH_KEY": "test-auth-key", "TAILSCALE_SSH": "true"},
+                    clear=True,
+                ),
+                patch("main.Path.home", return_value=Path(temp_dir)),
+                patch("main.subprocess.Popen", side_effect=launch_daemon),
+                patch("main.subprocess.run", side_effect=lambda command, **kwargs: commands.append(command)),
+            ):
+                start_tailscale()
 
-class CloudflareTunnelTests(unittest.TestCase):
-    def test_unset_token_disables_tunnel(self) -> None:
-        with patch.dict(os.environ, {}, clear=True):
-            self.assertIsNone(cloudflared_command())
-
-    def test_token_builds_requested_command(self) -> None:
-        self.assertEqual(
-            cloudflared_command("tunnel-secret"),
-            ["cloudflared", "tunnel", "run", "--token", "tunnel-secret"],
-        )
-
-    def test_starts_cloudflared_with_environment_token(self) -> None:
-        with (
-            patch.dict(os.environ, {"CLOUDFLARE_TUNNEL_TOKEN": "tunnel-secret"}),
-            patch("main.subprocess.Popen") as popen,
-        ):
-            process = start_cloudflare_tunnel()
-        self.assertIs(process, popen.return_value)
-        popen.assert_called_once_with(
-            ["cloudflared", "tunnel", "run", "--token", "tunnel-secret"]
-        )
-
+            self.assertIn("--ssh=true", commands[0])
 
 if __name__ == "__main__":
     unittest.main()
